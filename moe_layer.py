@@ -7,8 +7,8 @@ kernels/moe.cu exposes a single moe_forward() that fuses:
   + custom FP8 Tensor Core GEMM1 with fused SwiGLU into block-scaled FP8 C
   + custom FP8 Tensor Core GEMM2 with scatter accumulation
 
-run_custom() passes hidden_states as true FP8 tensors, packs gemm1/gemm2
-weights once into the exact mma.m16n8k32 B-fragment layout, and delegates to
+run_custom() passes hidden_states/gemm1_weights as true FP8 tensors for Stage 1,
+passes gemm2_weights as true FP8 tensors for Stage 2, and delegates to
 ops.moe_forward() without materializing dequantized weights.
 """
 

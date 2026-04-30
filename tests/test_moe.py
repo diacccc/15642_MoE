@@ -26,18 +26,13 @@ def _check(T, ref, got, atol=1e-2, rtol=2e-2):
     max_err = abs_err.max().item()
     tol = atol + rtol * ref_f.abs()
     max_tol_ratio = (abs_err / tol).max().item()
-    rel_mask = ref_f.abs() >= atol
-    max_rel = (
-        (abs_err[rel_mask] / ref_f[rel_mask].abs()).max().item()
-        if rel_mask.any()
-        else 0.0
-    )
+    rel_err = (abs_err / (ref.float().abs() + 1e-6)).max().item()
+
     bad = abs_err > tol
     bad_count = bad.sum().item()
     print(
-        f"  [T={T:>3}]  max_abs={max_err:.4e}  "
-        f"max_rel(|ref|>=atol)={max_rel:.4e}  "
-        f"max_tol_ratio={max_tol_ratio:.4e}  bad={bad_count}"
+        f"{T:>3},{max_err:.4e},"
+        f"{rel_err:.4e},{max_tol_ratio:.4e},{bad_count}"
     )
     assert not bad.any(), (
         f"T={T}: {bad_count} values exceed atol={atol} + rtol={rtol} * abs(ref); "
@@ -49,8 +44,8 @@ def test_moe(ops, T):
     inputs   = build_moe_inputs(T=T, device=DEVICE, seed=T)
     out_ref  = reference.run(**inputs).float()
     out_cust = run_custom(ops, **inputs).float()
+    torch.allclose(out_cust, out_ref, atol=1e-2, rtol=2e-2)
     _check(T, out_ref, out_cust)
-    print(f"  [T={T:>3}]  PASSED")
 
 
 # ── run_all: called by modal_app.py ──────────────────────────────────────────
@@ -59,6 +54,7 @@ def run_all(ops) -> bool:
     ok = True
     try:
         print("\n── moe_forward correctness (custom vs reference) ──")
+        print(f"{'T,max_err,rel_err,max_tol_ratio,bad_count':>40}")
         for T in TEST_T_VALUES:
             test_moe(ops, T)
         print("\nAll tests PASSED.")
