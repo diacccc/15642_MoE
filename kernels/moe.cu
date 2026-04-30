@@ -1,309 +1,641 @@
 /*
- * Custom MoE kernels for DeepSeek-V3/R1 geometry.
+ * Custom MoE forward pass for the fixed DeepSeek-V3/R1 geometry.
  *
- * Three fused kernels replace the scattered PyTorch ops in the reference:
+ * This version deliberately avoids cuBLAS. It keeps the complete routed MoE
+ * path on custom CUDA kernels:
  *
- *   1. fused_routing_kernel   — sigmoid → group scoring → group top-k →
- *                               global top-k → weight normalisation, all
- *                               in a single kernel launch per batch.
+ *   1. route_dispatch_kernel
+ *        sigmoid -> group top-k -> global top-k -> normalized weights, then
+ *        compact local (token, expert, weight) work into per-expert queues.
  *
- *   2. swiglu_kernel          — split + SiLU(X2)*X1 in one pass over memory
- *                               (avoids storing the full [N, 2*I] intermediate
- *                               twice).
+ *   2. stage1_fp8_mma_kernel
+ *        custom FP8 Tensor Core GEMM over true FP8 inputs:
+ *        hidden[token, H] x W13[expert, 2I, H]^T, then fused SwiGLU
+ *        into a compact bf16 C[expert, slot, I] intermediate.
  *
- *   3. weighted_scatter_accum_kernel — scale each expert-output row by its
- *                               routing weight and atomically accumulate into
- *                               the output buffer, replacing index_add_ calls.
+ *   3. build_active_tiles_kernel
+ *        converts per-expert token counts into a compact list of non-empty
+ *        (expert, token-tile) work. This avoids launching Tensor Core CTAs for
+ *        empty expert tiles when T is large.
  *
- * Build via torch.utils.cpp_extension.load().
+ *   4. stage2_fp8_mma_scatter_kernel
+ *        custom FP8 Tensor Core GEMM with fused epilogue:
+ *        C x W2[expert, H, I]^T over true FP8 W2 bytes with block scales,
+ *        then weighted atomic accumulation directly into the final token output.
+ *
+ *   5. bf16_convert_kernel
+ *        converts the float accumulator to the public bf16 result.
+ *
+ * Only moe_forward() is exported to Python.
  */
 
 #include <cuda_runtime.h>
+#include <cuda_fp8.h>
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#include <cstdint>
 
-// ── Fixed DeepSeek-V3/R1 routing geometry ────────────────────────────────────
+// Fixed DeepSeek-V3/R1 geometry.
 static constexpr int E_GLOBAL   = 256;
 static constexpr int N_GROUP    = 8;
 static constexpr int GROUP_SIZE = E_GLOBAL / N_GROUP;  // 32
 static constexpr int TOP_K      = 8;
 static constexpr int TOPK_GROUP = 4;
+static constexpr int H_FIXED    = 7168;
+static constexpr int I_FIXED    = 2048;
+static constexpr int G1_COLS    = 2 * I_FIXED;
+static constexpr int SCALE_BLOCK = 128;
+static constexpr int H_BLOCKS    = H_FIXED / SCALE_BLOCK;
+static constexpr int I_BLOCKS    = I_FIXED / SCALE_BLOCK;
+static constexpr int G1_BLOCKS   = G1_COLS / SCALE_BLOCK;
+
+// Warp-level FP8 MMA tile.
+static constexpr int MMA_M = 16;
+static constexpr int MMA_N = 8;
+static constexpr int MMA_K = 32;
+static constexpr int WARP_THREADS = 32;
+static constexpr int MMA_WARPS_PER_CTA = 4;
+static constexpr int MMA_THREADS = MMA_WARPS_PER_CTA * WARP_THREADS;
+
+__device__ __forceinline__ uint8_t fp32_to_e4m3_byte(float x)
+{
+    return (uint8_t)__nv_fp8_e4m3(x).__x;
+}
+
+__device__ __forceinline__ uint16_t fp32_to_bf16_bits(float x)
+{
+    uint32_t bits = __float_as_uint(x);
+    uint32_t lsb = (bits >> 16) & 1u;
+    uint32_t rounding_bias = 0x7fffu + lsb;
+    return (uint16_t)((bits + rounding_bias) >> 16);
+}
+
+__device__ __forceinline__ float bf16_bits_to_fp32(uint16_t x)
+{
+    return __uint_as_float((uint32_t)x << 16);
+}
+
+__device__ __forceinline__ uint32_t pack_e4m3x4(
+    uint8_t x0, uint8_t x1, uint8_t x2, uint8_t x3)
+{
+    return ((uint32_t)x0) |
+           ((uint32_t)x1 << 8) |
+           ((uint32_t)x2 << 16) |
+           ((uint32_t)x3 << 24);
+}
+
+__device__ __forceinline__ void mma_m16n8k32_e4m3(float acc[4],
+                                                  const uint32_t a[4],
+                                                  const uint32_t b[2])
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,%1,%2,%3}, "
+        "{%4,%5,%6,%7}, "
+        "{%8,%9}, "
+        "{%0,%1,%2,%3};\n"
+        : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]));
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Kernel 1: Fused routing
-//
-// Grid : (T,) – one block per token
-// Block: E_GLOBAL=256 threads – one thread per expert
-//
-// Steps executed collaboratively:
-//   A) All 256 threads: sigmoid(logit) + bias  → sh_sig, sh_sig_biased
-//   B) Threads 0..7:    top-2-sum per group    → sh_group_scores
-//   C) Thread 0:        greedy top-TOPK_GROUP  → sh_group_mask
-//   D) All 256 threads: mask out pruned groups → sh_masked
-//   E) Thread 0:        greedy top-TOP_K       → sh_topk_idx, sh_topk_sig
-//   F) Thread 0:        normalise weights, write output
+// Routing + compact local dispatch
 // ─────────────────────────────────────────────────────────────────────────────
-__global__ void fused_routing_kernel(
-    const float* __restrict__ logits,        // [T, E_GLOBAL]
-    const float* __restrict__ bias,          // [E_GLOBAL]
-    int*         __restrict__ out_topk_idx,  // [T, TOP_K]
-    float*       __restrict__ out_topk_w,    // [T, TOP_K]
-    float        routed_scaling_factor,
-    int          T)
+__global__ void route_dispatch_kernel(
+    const float* __restrict__ logits,
+    const float* __restrict__ bias,
+    int*         __restrict__ dispatch_token,
+    float*       __restrict__ dispatch_weight,
+    int*         __restrict__ expert_counts,
+    float rsf,
+    int T,
+    int E_local,
+    int local_offset)
 {
     int t = (int)blockIdx.x;
     if (t >= T) return;
-    int e = (int)threadIdx.x;  // 0 .. E_GLOBAL-1
+    int e = (int)threadIdx.x;
 
-    __shared__ float sh_sig[E_GLOBAL];        // sigmoid(logit)
-    __shared__ float sh_sig_biased[E_GLOBAL]; // sigmoid(logit) + bias
+    __shared__ float sh_sig[E_GLOBAL];
+    __shared__ float sh_sig_biased[E_GLOBAL];
     __shared__ float sh_group_scores[N_GROUP];
     __shared__ int   sh_group_mask[N_GROUP];
-    __shared__ float sh_masked[E_GLOBAL];     // pruned biased scores
-    __shared__ bool  sh_selected[E_GLOBAL];   // top-k selection state
+    __shared__ float sh_masked[E_GLOBAL];
+    __shared__ bool  sh_selected[E_GLOBAL];
     __shared__ int   sh_topk_idx[TOP_K];
-    __shared__ float sh_topk_sig[TOP_K];      // sig (no bias) for weighting
+    __shared__ float sh_topk_sig[TOP_K];
 
-    // ── A: sigmoid ───────────────────────────────────────────────────────────
-    float logit = logits[(size_t)t * E_GLOBAL + e];
-    float sig   = 1.0f / (1.0f + expf(-logit));
+    float sig        = 1.0f / (1.0f + expf(-logits[(size_t)t * E_GLOBAL + e]));
     sh_sig[e]        = sig;
     sh_sig_biased[e] = sig + bias[e];
     sh_selected[e]   = false;
     __syncthreads();
 
-    // ── B: group scores (threads 0..N_GROUP-1, each owns one group) ──────────
     if (e < N_GROUP) {
-        int base  = e * GROUP_SIZE;
-        float t1  = -1e30f, t2 = -1e30f;
+        int base = e * GROUP_SIZE;
+        float g1 = -1e30f;
+        float g2 = -1e30f;
         for (int i = base; i < base + GROUP_SIZE; ++i) {
             float v = sh_sig_biased[i];
-            if      (v > t1) { t2 = t1; t1 = v; }
-            else if (v > t2) { t2 = v; }
+            if (v > g1) {
+                g2 = g1;
+                g1 = v;
+            } else if (v > g2) {
+                g2 = v;
+            }
         }
-        sh_group_scores[e] = t1 + t2;
+        sh_group_scores[e] = g1 + g2;
         sh_group_mask[e]   = 0;
     }
     __syncthreads();
 
-    // ── C: select top-TOPK_GROUP groups (thread 0, O(N_GROUP*TOPK_GROUP)) ────
     if (e == 0) {
         for (int k = 0; k < TOPK_GROUP; ++k) {
-            float best_v = -1e30f;
-            int   best_g = -1;
+            float bv = -1e30f;
+            int bg = -1;
             for (int g = 0; g < N_GROUP; ++g) {
-                if (!sh_group_mask[g] && sh_group_scores[g] > best_v) {
-                    best_v = sh_group_scores[g];
-                    best_g = g;
+                if (!sh_group_mask[g] && sh_group_scores[g] > bv) {
+                    bv = sh_group_scores[g];
+                    bg = g;
                 }
             }
-            if (best_g >= 0) sh_group_mask[best_g] = 1;
+            if (bg >= 0) sh_group_mask[bg] = 1;
         }
     }
     __syncthreads();
 
-    // ── D: mask out non-selected groups ──────────────────────────────────────
     sh_masked[e] = sh_group_mask[e / GROUP_SIZE] ? sh_sig_biased[e] : -1e30f;
     __syncthreads();
 
-    // ── E: global top-k among kept groups (thread 0, O(E_GLOBAL*TOP_K)) ─────
     if (e == 0) {
         for (int k = 0; k < TOP_K; ++k) {
-            float best_v = -1e30f;
-            int   best_e = -1;
+            float bv = -1e30f;
+            int be = -1;
             for (int i = 0; i < E_GLOBAL; ++i) {
-                if (!sh_selected[i] && sh_masked[i] > best_v) {
-                    best_v = sh_masked[i];
-                    best_e = i;
+                if (!sh_selected[i] && sh_masked[i] > bv) {
+                    bv = sh_masked[i];
+                    be = i;
                 }
             }
-            sh_topk_idx[k] = best_e;
-            sh_topk_sig[k] = (best_e >= 0) ? sh_sig[best_e] : 0.0f;
-            if (best_e >= 0) sh_selected[best_e] = true;
+            sh_topk_idx[k] = be;
+            sh_topk_sig[k] = (be >= 0) ? sh_sig[be] : 0.0f;
+            if (be >= 0) sh_selected[be] = true;
         }
-    }
-    __syncthreads();
 
-    // ── F: normalise and write (thread 0) ────────────────────────────────────
-    if (e == 0) {
         float wsum = 1e-20f;
         for (int k = 0; k < TOP_K; ++k) wsum += sh_topk_sig[k];
 
-        int*   oi = out_topk_idx + (size_t)t * TOP_K;
-        float* ow = out_topk_w   + (size_t)t * TOP_K;
         for (int k = 0; k < TOP_K; ++k) {
-            oi[k] = sh_topk_idx[k];
-            ow[k] = (sh_topk_sig[k] / wsum) * routed_scaling_factor;
+            int ge = sh_topk_idx[k];
+            int le = ge - local_offset;
+            if (0 <= le && le < E_local) {
+                int slot = atomicAdd(&expert_counts[le], 1);
+                if (slot < T) {
+                    size_t off = (size_t)le * T + slot;
+                    dispatch_token[off]  = t;
+                    dispatch_weight[off] = (sh_topk_sig[k] / wsum) * rsf;
+                }
+            }
         }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Kernel 2: Fused SwiGLU
-//
-// Grid : (N, ceil(I / BLOCK_COLS))
-// Block: (BLOCK_COLS,)
-//
-// Each thread reads gate=input[row, col] and val=input[row, I+col],
-// computes silu(val)*gate, writes output[row, col].
-// One read pass over the 2*I input (vs. two passes for split-then-apply).
+// Build compact list of active (expert, M tile) work.
 // ─────────────────────────────────────────────────────────────────────────────
-__global__ void swiglu_kernel(
-    const float* __restrict__ input,   // [N, 2*I]
-    float*       __restrict__ output,  // [N, I]
-    int N, int I)
+__global__ void build_active_tiles_kernel(
+    const int* __restrict__ expert_counts,
+    int*       __restrict__ tile_expert,
+    int*       __restrict__ tile_m0,
+    int*       __restrict__ tile_count,
+    int E_local)
 {
-    int row = (int)blockIdx.x;
-    int col = (int)(blockIdx.y * blockDim.x) + (int)threadIdx.x;
-    if (row >= N || col >= I) return;
+    int le = (int)blockIdx.x;
+    if (le >= E_local) return;
 
-    float gate  = input[(size_t)row * 2 * I + col];
-    float value = input[(size_t)row * 2 * I + I + col];
-    float silu  = value / (1.0f + expf(-value));
-    output[(size_t)row * I + col] = silu * gate;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Kernel 3: Weighted scatter accumulation
-//
-// Grid : (Tk,) – one block per (dispatched-token, expert) pair
-// Block: (BLOCK_H,) threads that stride over H
-//
-// Replaces the per-expert index_add_ calls in the reference:
-// atomicAdd allows all expert outputs to be accumulated concurrently.
-// ─────────────────────────────────────────────────────────────────────────────
-__global__ void weighted_scatter_accum_kernel(
-    const float* __restrict__ src,        // [Tk, H] — expert output rows
-    const int*   __restrict__ token_idx,  // [Tk]    — destination token
-    const float* __restrict__ weight,     // [Tk]    — scalar weight per row
-    float*       __restrict__ dst,        // [T,  H] — output accumulator
-    int Tk, int H)
-{
-    int row = (int)blockIdx.x;
-    if (row >= Tk) return;
-
-    int   t = token_idx[row];
-    float w = weight[row];
-
-    for (int col = (int)threadIdx.x; col < H; col += (int)blockDim.x) {
-        atomicAdd(&dst[(size_t)t * H + col],
-                  src[(size_t)row * H + col] * w);
+    int count = expert_counts[le];
+    int tiles = (count + MMA_M - 1) / MMA_M;
+    for (int tile = (int)threadIdx.x; tile < tiles; tile += (int)blockDim.x) {
+        int out = atomicAdd(tile_count, 1);
+        tile_expert[out] = le;
+        tile_m0[out] = tile * MMA_M;
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PyTorch C++ wrappers
+// Stage 1: gathered hidden x W13^T, custom FP8 Tensor Core GEMM.
+//
+// This consumes true FP8 hidden states and GEMM1 weights. The raw FP8 dot
+// product is accumulated over each 128-wide scale block for gate and up
+// projections together, then Stage 1 writes only bf16 SwiGLU output C.
 // ─────────────────────────────────────────────────────────────────────────────
+__global__ void stage1_fp8_mma_kernel(
+    const uint8_t* __restrict__ hidden,
+    const float*   __restrict__ hidden_scale,
+    const uint8_t* __restrict__ W13,
+    const float*   __restrict__ W13_scale,
+    const int*   __restrict__ dispatch_token,
+    const int*   __restrict__ expert_counts,
+    const int*   __restrict__ tile_expert,
+    const int*   __restrict__ tile_m0,
+    const int*   __restrict__ tile_count,
+    uint16_t*    __restrict__ C,
+    int T)
+{
+    int tile_id = (int)blockIdx.y;
+    if (tile_id >= tile_count[0]) return;
+    int le = tile_expert[tile_id];
+    int m0 = tile_m0[tile_id];
+    int warp_id = (int)threadIdx.x / WARP_THREADS;
+    int lane = (int)threadIdx.x - warp_id * WARP_THREADS;
+    int n0 = ((int)blockIdx.x * MMA_WARPS_PER_CTA + warp_id) * MMA_N;
+    int group = lane >> 2;
+    int thread_in_group = lane & 3;
+    int count = expert_counts[le];
+    if (m0 >= count || n0 >= I_FIXED) return;
 
-/*
- * fused_routing(logits, bias, routed_scaling_factor)
- *   logits : float32 [T, 256]
- *   bias   : float32 [256]
- *   returns: (topk_idx int32 [T,8], topk_weights float32 [T,8])
- */
-std::vector<torch::Tensor> fused_routing(
+    float gate_acc[4]  = {0.0f, 0.0f, 0.0f, 0.0f};
+    float value_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int kb = 0; kb < H_BLOCKS; ++kb) {
+        float raw_gate[4]  = {0.0f, 0.0f, 0.0f, 0.0f};
+        float raw_value[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        for (int kk = 0; kk < SCALE_BLOCK; kk += MMA_K) {
+            int k0 = kb * SCALE_BLOCK + kk;
+            uint32_t a_frag[4];
+            uint32_t b_gate[2];
+            uint32_t b_value[2];
+
+#pragma unroll
+            for (int reg = 0; reg < 4; ++reg) {
+                uint8_t bytes[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    int i = reg * 4 + j;
+                    int row = ((i < 4) || (8 <= i && i < 12)) ? group : group + 8;
+                    int col = thread_in_group * 4 + (i & 3) + ((i >= 8) ? 16 : 0);
+                    int slot = m0 + row;
+                    uint8_t v = 0;
+                    if (slot < count) {
+                        int token = dispatch_token[(size_t)le * T + slot];
+                        v = hidden[(size_t)token * H_FIXED + k0 + col];
+                    }
+                    bytes[j] = v;
+                }
+                a_frag[reg] = pack_e4m3x4(bytes[0], bytes[1], bytes[2], bytes[3]);
+            }
+
+#pragma unroll
+            for (int reg = 0; reg < 2; ++reg) {
+                uint8_t bytes[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    int i = reg * 4 + j;
+                    int row = thread_in_group * 4 + (i & 3) + ((i >= 4) ? 16 : 0);
+                    int col = group;
+                    int n = n0 + col;
+                    uint8_t v = 0;
+                    if (n < I_FIXED) {
+                        v = W13[((size_t)le * G1_COLS + n) * H_FIXED + k0 + row];
+                    }
+                    bytes[j] = v;
+                }
+                b_gate[reg] = pack_e4m3x4(bytes[0], bytes[1], bytes[2], bytes[3]);
+            }
+
+            for (int reg = 0; reg < 2; ++reg) {
+                uint8_t bytes[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    int i = reg * 4 + j;
+                    int row = thread_in_group * 4 + (i & 3) + ((i >= 4) ? 16 : 0);
+                    int col = group;
+                    int n = n0 + col;
+                    uint8_t v = 0;
+                    if (n < I_FIXED) {
+                        int value_n = I_FIXED + n;
+                        v = W13[((size_t)le * G1_COLS + value_n) * H_FIXED + k0 + row];
+                    }
+                    bytes[j] = v;
+                }
+                b_value[reg] = pack_e4m3x4(bytes[0], bytes[1], bytes[2], bytes[3]);
+            }
+
+            mma_m16n8k32_e4m3(raw_gate, a_frag, b_gate);
+            mma_m16n8k32_e4m3(raw_value, a_frag, b_value);
+        }
+
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int row = (i < 2) ? group : group + 8;
+            int col = thread_in_group * 2 + (i & 1);
+            int slot = m0 + row;
+            int n = n0 + col;
+            if (slot < count && n < I_FIXED) {
+                int token = dispatch_token[(size_t)le * T + slot];
+                int nb = n / SCALE_BLOCK;
+                float as = hidden_scale[(size_t)kb * T + token];
+                float gate_scale =
+                    W13_scale[((size_t)le * G1_BLOCKS + nb) * H_BLOCKS + kb];
+                float value_scale =
+                    W13_scale[((size_t)le * G1_BLOCKS + (I_FIXED / SCALE_BLOCK + nb)) *
+                              H_BLOCKS + kb];
+                gate_acc[i]  += raw_gate[i] * as * gate_scale;
+                value_acc[i] += raw_value[i] * as * value_scale;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int row = (i < 2) ? group : group + 8;
+        int col = thread_in_group * 2 + (i & 1);
+        int slot = m0 + row;
+        int n = n0 + col;
+        if (slot < count && n < I_FIXED) {
+            float value = value_acc[i];
+            float c = gate_acc[i] * (value / (1.0f + expf(-value)));
+            C[((size_t)le * T + slot) * I_FIXED + n] = fp32_to_bf16_bits(c);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 2: custom FP8 Tensor Core GEMM + weighted scatter
+// ─────────────────────────────────────────────────────────────────────────────
+__global__ void stage2_fp8_mma_scatter_kernel(
+    const uint16_t* __restrict__ C,
+    const uint8_t*  __restrict__ W2,
+    const float*    __restrict__ W2_scale,
+    const int*   __restrict__ dispatch_token,
+    const float* __restrict__ dispatch_weight,
+    const int*   __restrict__ expert_counts,
+    const int*   __restrict__ tile_expert,
+    const int*   __restrict__ tile_m0,
+    const int*   __restrict__ tile_count,
+    float*       __restrict__ output,
+    int T)
+{
+    int tile_id = (int)blockIdx.y;
+    if (tile_id >= tile_count[0]) return;
+    int le = tile_expert[tile_id];
+    int m0 = tile_m0[tile_id];
+    int warp_id = (int)threadIdx.x / WARP_THREADS;
+    int lane = (int)threadIdx.x - warp_id * WARP_THREADS;
+    int h0 = ((int)blockIdx.x * MMA_WARPS_PER_CTA + warp_id) * MMA_N;
+    int group = lane >> 2;
+    int thread_in_group = lane & 3;
+    int count = expert_counts[le];
+    if (m0 >= count || h0 >= H_FIXED) return;
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int ib = 0; ib < I_BLOCKS; ++ib) {
+        float raw_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        for (int kk = 0; kk < SCALE_BLOCK; kk += MMA_K) {
+            int i0 = ib * SCALE_BLOCK + kk;
+            uint32_t a_frag[4];
+            uint32_t b_frag[2];
+
+#pragma unroll
+            for (int reg = 0; reg < 4; ++reg) {
+                uint8_t bytes[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    int i = reg * 4 + j;
+                    int row = ((i < 4) || (8 <= i && i < 12)) ? group : group + 8;
+                    int col = thread_in_group * 4 + (i & 3) + ((i >= 8) ? 16 : 0);
+                    int slot = m0 + row;
+                    int inner = i0 + col;
+                    float v = 0.0f;
+                    if (slot < count) {
+                        v = bf16_bits_to_fp32(C[((size_t)le * T + slot) * I_FIXED + inner]);
+                    }
+                    bytes[j] = fp32_to_e4m3_byte(v);
+                }
+                a_frag[reg] = pack_e4m3x4(bytes[0], bytes[1], bytes[2], bytes[3]);
+            }
+
+#pragma unroll
+            for (int reg = 0; reg < 2; ++reg) {
+                uint8_t bytes[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    int i = reg * 4 + j;
+                    int row = thread_in_group * 4 + (i & 3) + ((i >= 4) ? 16 : 0);
+                    int col = group;
+                    int h = h0 + col;
+                    uint8_t v = 0;
+                    if (h < H_FIXED) {
+                        v = W2[((size_t)le * H_FIXED + h) * I_FIXED + i0 + row];
+                    }
+                    bytes[j] = v;
+                }
+                b_frag[reg] = pack_e4m3x4(bytes[0], bytes[1], bytes[2], bytes[3]);
+            }
+
+            mma_m16n8k32_e4m3(raw_acc, a_frag, b_frag);
+        }
+
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int col = thread_in_group * 2 + (i & 1);
+            int h = h0 + col;
+            if (h < H_FIXED) {
+                int hb = h / SCALE_BLOCK;
+                float ws = W2_scale[((size_t)le * H_BLOCKS + hb) * I_BLOCKS + ib];
+                acc[i] += raw_acc[i] * ws;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int row = (i < 2) ? group : group + 8;
+        int col = thread_in_group * 2 + (i & 1);
+        int slot = m0 + row;
+        int h = h0 + col;
+        if (slot < count && h < H_FIXED) {
+            size_t qoff = (size_t)le * T + slot;
+            int token = dispatch_token[qoff];
+            float w = dispatch_weight[qoff];
+            atomicAdd(&output[(size_t)token * H_FIXED + h], acc[i] * w);
+        }
+    }
+}
+
+__global__ void bf16_convert_kernel(
+    const float* __restrict__ src,
+    uint16_t*    __restrict__ dst,
+    int n)
+{
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i < n) dst[i] = fp32_to_bf16_bits(src[i]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public entry point
+// ─────────────────────────────────────────────────────────────────────────────
+torch::Tensor moe_forward(
+    torch::Tensor hidden,
+    torch::Tensor hidden_scale,
+    torch::Tensor W13_fp8,
+    torch::Tensor W13_scale,
+    torch::Tensor W2_fp8,
+    torch::Tensor W2_scale,
     torch::Tensor logits,
     torch::Tensor bias,
-    float         routed_scaling_factor)
+    float rsf,
+    int local_offset)
 {
-    TORCH_CHECK(logits.dim() == 2 && logits.size(1) == E_GLOBAL,
-                "logits must be [T, 256]");
-    TORCH_CHECK(bias.numel() == E_GLOBAL, "bias must have 256 elements");
+    const at::cuda::CUDAGuard guard(hidden.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    TORCH_CHECK(hidden.dim() == 2, "hidden must be [T, 7168]");
+    TORCH_CHECK(hidden_scale.dim() == 2, "hidden_scale must be [56, T]");
+    TORCH_CHECK(W13_fp8.dim() == 3, "W13 must be [E_local, 4096, 7168]");
+    TORCH_CHECK(W13_scale.dim() == 3, "W13_scale must be [E_local, 32, 56]");
+    TORCH_CHECK(W2_fp8.dim() == 3, "W2 must be [E_local, 7168, 2048]");
+    TORCH_CHECK(W2_scale.dim() == 3, "W2_scale must be [E_local, 56, 16]");
+    TORCH_CHECK(logits.dim() == 2, "logits must be [T, 256]");
+    TORCH_CHECK(hidden.element_size() == 1, "hidden must be an FP8 tensor");
+    TORCH_CHECK(hidden_scale.scalar_type() == torch::kFloat32,
+                "hidden_scale must be float32");
+    TORCH_CHECK(W13_fp8.element_size() == 1, "W13 must be an FP8 tensor");
+    TORCH_CHECK(W13_scale.scalar_type() == torch::kFloat32,
+                "W13_scale must be float32");
+    TORCH_CHECK(W2_fp8.element_size() == 1, "W2 must be an FP8 tensor");
+    TORCH_CHECK(W2_scale.scalar_type() == torch::kFloat32,
+                "W2_scale must be float32");
     TORCH_CHECK(logits.scalar_type() == torch::kFloat32, "logits must be float32");
-    TORCH_CHECK(bias.scalar_type()   == torch::kFloat32, "bias must be float32");
+    TORCH_CHECK(bias.scalar_type() == torch::kFloat32, "bias must be float32");
 
-    const at::cuda::CUDAGuard guard(logits.device());
-    int T = (int)logits.size(0);
+    int T       = (int)hidden.size(0);
+    int H_dim   = (int)hidden.size(1);
+    int E_local = (int)W13_fp8.size(0);
 
-    auto topk_idx = torch::empty({T, TOP_K},
-                        torch::TensorOptions().dtype(torch::kInt32).device(logits.device()));
-    auto topk_w   = torch::empty({T, TOP_K},
-                        torch::TensorOptions().dtype(torch::kFloat32).device(logits.device()));
+    TORCH_CHECK(H_dim == H_FIXED, "hidden must have hidden dim 7168");
+    TORCH_CHECK(hidden_scale.size(0) == H_BLOCKS && hidden_scale.size(1) == T,
+                "hidden_scale must be [56, T]");
+    TORCH_CHECK(logits.size(1) == E_GLOBAL, "logits must be [T, 256]");
+    TORCH_CHECK(bias.numel() == E_GLOBAL, "bias must have 256 elements");
+    TORCH_CHECK(W13_fp8.size(1) == G1_COLS && W13_fp8.size(2) == H_FIXED,
+                "W13 must be [E_local, 4096, 7168]");
+    TORCH_CHECK(W13_scale.size(0) == E_local &&
+                W13_scale.size(1) == G1_BLOCKS &&
+                W13_scale.size(2) == H_BLOCKS,
+                "W13_scale must be [E_local, 32, 56]");
+    TORCH_CHECK(W2_fp8.size(0) == E_local &&
+                W2_fp8.size(1) == H_FIXED &&
+                W2_fp8.size(2) == I_FIXED,
+                "W2 must be [E_local, 7168, 2048]");
+    TORCH_CHECK(W2_scale.size(0) == E_local &&
+                W2_scale.size(1) == H_BLOCKS &&
+                W2_scale.size(2) == I_BLOCKS,
+                "W2_scale must be [E_local, 56, 16]");
+    TORCH_CHECK(hidden.is_contiguous(), "hidden must be contiguous");
+    TORCH_CHECK(hidden_scale.is_contiguous(), "hidden_scale must be contiguous");
+    TORCH_CHECK(W13_fp8.is_contiguous(), "W13 must be contiguous");
+    TORCH_CHECK(W13_scale.is_contiguous(), "W13_scale must be contiguous");
+    TORCH_CHECK(W2_fp8.is_contiguous(), "W2 must be contiguous");
+    TORCH_CHECK(W2_scale.is_contiguous(), "W2_scale must be contiguous");
+    TORCH_CHECK(logits.is_contiguous(), "logits must be contiguous");
+    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
 
-    fused_routing_kernel<<<T, E_GLOBAL, 0, at::cuda::getCurrentCUDAStream()>>>(
+    auto int_opts = torch::TensorOptions().device(hidden.device()).dtype(torch::kInt32);
+    auto fp_opts  = torch::TensorOptions().device(hidden.device()).dtype(torch::kFloat32);
+
+    auto expert_counts   = torch::empty({E_local}, int_opts);
+    auto dispatch_token  = torch::empty({E_local, T}, int_opts);
+    auto dispatch_weight = torch::empty({E_local, T}, fp_opts);
+    auto C               = torch::empty({E_local, T, I_FIXED},
+                                        hidden.options().dtype(torch::kBFloat16));
+    auto output_fp32     = torch::empty({T, H_FIXED}, fp_opts);
+    auto output_bf16     = torch::empty({T, H_FIXED}, hidden.options().dtype(torch::kBFloat16));
+    int max_active_tiles = E_local * ((T + MMA_M - 1) / MMA_M);
+    auto tile_expert     = torch::empty({max_active_tiles}, int_opts);
+    auto tile_m0         = torch::empty({max_active_tiles}, int_opts);
+    auto tile_count      = torch::empty({1}, int_opts);
+
+    C10_CUDA_CHECK(cudaMemsetAsync(expert_counts.data_ptr<int>(), 0,
+                                   (size_t)E_local * sizeof(int), stream));
+    C10_CUDA_CHECK(cudaMemsetAsync(output_fp32.data_ptr<float>(), 0,
+                                   (size_t)T * H_FIXED * sizeof(float), stream));
+    C10_CUDA_CHECK(cudaMemsetAsync(tile_count.data_ptr<int>(), 0,
+                                   sizeof(int), stream));
+
+    route_dispatch_kernel<<<T, E_GLOBAL, 0, stream>>>(
         logits.data_ptr<float>(),
         bias.data_ptr<float>(),
-        topk_idx.data_ptr<int>(),
-        topk_w.data_ptr<float>(),
-        routed_scaling_factor,
-        T);
+        dispatch_token.data_ptr<int>(),
+        dispatch_weight.data_ptr<float>(),
+        expert_counts.data_ptr<int>(),
+        rsf,
+        T,
+        E_local,
+        local_offset);
 
-    return {topk_idx, topk_w};
-}
+    build_active_tiles_kernel<<<E_local, 128, 0, stream>>>(
+        expert_counts.data_ptr<int>(),
+        tile_expert.data_ptr<int>(),
+        tile_m0.data_ptr<int>(),
+        tile_count.data_ptr<int>(),
+        E_local);
 
-/*
- * swiglu_forward(input)
- *   input  : float32 [N, 2*I]
- *   returns: float32 [N, I]
- */
-torch::Tensor swiglu_forward(torch::Tensor input)
-{
-    TORCH_CHECK(input.dim() == 2 && input.size(1) % 2 == 0,
-                "input must be [N, 2*I]");
-    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "input must be float32");
-
-    const at::cuda::CUDAGuard guard(input.device());
-    int N = (int)input.size(0);
-    int I = (int)(input.size(1) / 2);
-
-    auto output = torch::empty({N, I},
-                      torch::TensorOptions().dtype(torch::kFloat32).device(input.device()));
-
-    constexpr int BLOCK_COLS = 256;
-    dim3 block(BLOCK_COLS);
-    dim3 grid(N, (I + BLOCK_COLS - 1) / BLOCK_COLS);
-
-    swiglu_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        input.data_ptr<float>(),
-        output.data_ptr<float>(),
-        N, I);
-
-    return output;
-}
-
-/*
- * weighted_scatter_accum(src, token_idx, weight, T, H)
- *   src       : float32 [Tk, H]
- *   token_idx : int32   [Tk]
- *   weight    : float32 [Tk]
- *   T         : number of output tokens
- *   H         : hidden dimension
- *   returns   : float32 [T, H]  (zero-initialised, then accumulated into)
- */
-torch::Tensor weighted_scatter_accum(
-    torch::Tensor src,
-    torch::Tensor token_idx,
-    torch::Tensor weight,
-    int T,
-    int H)
-{
-    TORCH_CHECK(src.dim() == 2 && src.size(1) == H, "src must be [Tk, H]");
-    TORCH_CHECK(src.scalar_type()       == torch::kFloat32, "src must be float32");
-    TORCH_CHECK(token_idx.scalar_type() == torch::kInt32,   "token_idx must be int32");
-    TORCH_CHECK(weight.scalar_type()    == torch::kFloat32, "weight must be float32");
-
-    const at::cuda::CUDAGuard guard(src.device());
-    int Tk = (int)src.size(0);
-
-    auto dst = torch::zeros({T, H},
-                   torch::TensorOptions().dtype(torch::kFloat32).device(src.device()));
-
-    if (Tk > 0) {
-        constexpr int BLOCK_H = 256;
-        weighted_scatter_accum_kernel<<<Tk, BLOCK_H, 0, at::cuda::getCurrentCUDAStream()>>>(
-            src.data_ptr<float>(),
-            token_idx.data_ptr<int>(),
-            weight.data_ptr<float>(),
-            dst.data_ptr<float>(),
-            Tk, H);
+    dim3 block(MMA_THREADS);
+    dim3 grid_stage1((I_FIXED + MMA_N * MMA_WARPS_PER_CTA - 1) /
+                         (MMA_N * MMA_WARPS_PER_CTA),
+                     max_active_tiles,
+                     1);
+    if (max_active_tiles > 0) {
+        stage1_fp8_mma_kernel<<<grid_stage1, block, 0, stream>>>(
+            reinterpret_cast<const uint8_t*>(hidden.data_ptr()),
+            hidden_scale.data_ptr<float>(),
+            reinterpret_cast<const uint8_t*>(W13_fp8.data_ptr()),
+            W13_scale.data_ptr<float>(),
+            dispatch_token.data_ptr<int>(),
+            expert_counts.data_ptr<int>(),
+            tile_expert.data_ptr<int>(),
+            tile_m0.data_ptr<int>(),
+            tile_count.data_ptr<int>(),
+            reinterpret_cast<uint16_t*>(C.data_ptr<at::BFloat16>()),
+            T);
     }
 
-    return dst;
+    dim3 grid_stage2((H_FIXED + MMA_N * MMA_WARPS_PER_CTA - 1) /
+                         (MMA_N * MMA_WARPS_PER_CTA),
+                     max_active_tiles,
+                     1);
+    if (max_active_tiles > 0) {
+        stage2_fp8_mma_scatter_kernel<<<grid_stage2, block, 0, stream>>>(
+            reinterpret_cast<const uint16_t*>(C.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const uint8_t*>(W2_fp8.data_ptr()),
+            W2_scale.data_ptr<float>(),
+            dispatch_token.data_ptr<int>(),
+            dispatch_weight.data_ptr<float>(),
+            expert_counts.data_ptr<int>(),
+            tile_expert.data_ptr<int>(),
+            tile_m0.data_ptr<int>(),
+            tile_count.data_ptr<int>(),
+            output_fp32.data_ptr<float>(),
+            T);
+    }
+
+    int n = T * H_FIXED;
+    bf16_convert_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+        output_fp32.data_ptr<float>(),
+        reinterpret_cast<uint16_t*>(output_bf16.data_ptr<at::BFloat16>()),
+        n);
+
+    return output_bf16;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fused_routing",          &fused_routing,          "Fused sigmoid+group-topk+global-topk+weight-norm");
-    m.def("swiglu_forward",         &swiglu_forward,         "Fused SwiGLU (SiLU(X2)*X1)");
-    m.def("weighted_scatter_accum", &weighted_scatter_accum, "Weighted scatter-add accumulation");
+    m.def("moe_forward", &moe_forward,
+          "Custom FP8 Tensor Core MoE forward without cuBLAS");
 }

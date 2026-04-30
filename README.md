@@ -4,13 +4,14 @@ Custom CUDA kernels for the Mixture-of-Experts (MoE) forward pass used in DeepSe
 
 ## Overview
 
-The reference implementation (`reference/moe_ref.py`) is a faithful PyTorch translation of the DeepSeek-V3/R1 MoE forward pass. Three custom CUDA kernels (`kernels/moe.cu`) replace the most memory-bandwidth-bound portions with fused GPU kernels, each producing numerically identical results.
+The reference implementation (`reference/moe_ref.py`) is a faithful PyTorch translation of the DeepSeek-V3/R1 MoE forward pass. The custom CUDA path (`kernels/moe.cu`) now exposes one `moe_forward()` entry point with no cuBLAS calls: routing compacts local expert work, Stage 1 fuses GEMM1 with SwiGLU into a compact bf16 intermediate, then Stage 2 runs GEMM2 over true FP8 W2 weights and weighted scatter.
 
 | Kernel | Replaces | Key optimization |
 |---|---|---|
-| `fused_routing_kernel` | ~10 PyTorch ops (sigmoid, topk, masked\_fill, scatter, normalize) | Single kernel launch; all 256 expert scores computed in parallel per token |
-| `swiglu_kernel` | split + `torch.exp` + multiply | One pass over memory instead of materializing intermediate tensors |
-| `weighted_scatter_accum_kernel` | per-expert `index_add_` loop | All expert outputs accumulated concurrently via `atomicAdd` |
+| `route_dispatch_kernel` | routing + Python-side token filtering | Selects top-k experts and compacts local `(token, expert, weight)` work on GPU |
+| `build_active_tiles_kernel` | fixed full expert/token-tile launch grid | Builds a compact list of non-empty expert token tiles to avoid idle Tensor Core CTAs |
+| `stage1_fp8_mma_kernel` | GEMM1 cuBLAS call + SwiGLU | Uses true FP8 hidden/weight inputs, computes gate/up together, and stores only bf16 `C = gate * SiLU(up)` |
+| `stage2_fp8_mma_scatter_kernel` | GEMM2 cuBLAS + per-expert `index_add_` | Uses true FP8 W2 bytes, applies W2 block scales inside accumulation, then weighted scatter |
 
 ### Fixed geometry (DeepSeek-V3/R1)
 
@@ -32,9 +33,9 @@ The reference implementation (`reference/moe_ref.py`) is a faithful PyTorch tran
 ├── kernels/
 │   └── moe.cu                  # Custom CUDA kernels + pybind11 wrappers
 ├── tests/
-│   └── test_moe.py             # Per-kernel correctness tests vs reference
+│   └── test_moe.py             # End-to-end moe_forward correctness vs reference
 ├── bench/
-│   └── bench_moe.py            # Per-kernel latency: custom vs PyTorch
+│   └── bench_moe.py            # End-to-end latency: custom vs PyTorch
 ├── moe_layer.py                # Kernel loader (JIT) and input builder
 ├── modal_app.py                # Modal B200 entry points
 └── requirements.txt
@@ -52,10 +53,10 @@ modal setup          # authenticate
 Then call any entry point directly — no local GPU needed:
 
 ```bash
-# Correctness: verify each kernel matches the reference math
+# Correctness: verify moe_forward matches the reference math
 modal run modal_app.py::test
 
-# Performance: per-kernel latency vs PyTorch equivalents
+# Performance: end-to-end latency vs PyTorch reference
 modal run modal_app.py::bench
 
 # Interactive shell on a B200 for exploration / debugging
@@ -64,7 +65,7 @@ modal run modal_app.py::shell
 
 ## Kernel details
 
-### `fused_routing_kernel`
+### `route_dispatch_kernel`
 
 Implements the DeepSeek no-aux-loss routing in a single kernel. Each thread block handles one token; 256 threads (one per expert) run in parallel.
 
@@ -78,21 +79,21 @@ Implements the DeepSeek no-aux-loss routing in a single kernel. Each thread bloc
 
 Replaces the reference sequence: `sigmoid → +bias → view → topk (group) → scatter → masked_fill → topk (global) → scatter → sum → div`.
 
-### `swiglu_kernel`
+### `build_active_tiles_kernel`
 
-Computes `silu(X2) * X1` where `X1 = input[:, :I]` and `X2 = input[:, I:]`. Reads each input element once and writes the output in the same pass, avoiding the two-read pattern of the reference split.
+Converts per-expert dispatch counts into a compact list of active `(expert, token-tile)` work. This prevents the large-`T` path from launching Tensor Core CTAs for empty expert slots.
 
-### `weighted_scatter_accum_kernel`
+### `stage1_fp8_mma_kernel`
 
-Each block handles one row of expert output. Threads stride over the hidden dimension `H=7168` and atomically accumulate `weight * expert_output` into the output buffer. Replacing the sequential per-expert `index_add_` loop allows contributions from all experts to be written concurrently.
+Computes the gate and up projections from true FP8 `hidden` and `W13` inputs using `mma.sync.aligned.m16n8k32...e4m3.e4m3...`. It applies the 128-wide block scales, fuses `C = gate * SiLU(up)`, and stores only bf16 `C[expert, slot, 2048]` instead of the full FP32 `[gate, up]` buffer.
+
+### `stage2_fp8_mma_scatter_kernel`
+
+Reads bf16 `C`, packs activation fragments to E4M3, multiplies by true FP8 `W2[expert].T` fragments, applies `gemm2_weights_scale[expert, h_block, i_block]` inside accumulation, and atomically accumulates the routed weighted result into the final `[T, H]` output.
 
 ## Correctness
 
-Each kernel is tested against the exact computation extracted from `moe_ref.py`:
-
-- **Routing** — selected expert sets must match exactly; weights within `1e-4` absolute error
-- **SwiGLU** — element-wise max absolute error `< 1e-5`
-- **Scatter accum** — element-wise max absolute error `< 1e-3`
+`moe_forward()` is tested end to end against the exact computation in `moe_ref.py` across several token counts. The test compares the final bf16 output with a `1e-2` absolute tolerance and `5%` max relative tolerance.
 
 ```bash
 modal run modal_app.py::test

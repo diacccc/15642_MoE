@@ -45,7 +45,7 @@ image = (
 
 app = modal.App("moe-kernels-h200", image=image)
 
-GPU = "h200"
+GPU = "H200:1"
 
 # Persist compiled extension across runs — ninja still rebuilds on source change
 build_cache = modal.Volume.from_name("moe-torch-ext-cache", create_if_missing=True)
@@ -78,16 +78,23 @@ def _compile_moe():
     cache_root = "/root/.cache/torch_extensions"
     os.makedirs(cache_root, exist_ok=True)
 
-    # Let load() decide whether to recompile based on source mtimes.
-    # Only wipe the cache manually if the build is corrupt (missing .so).
-    ext_dir = os.path.join(cache_root, "py311_cu128", "moe_kernels")
-    so_files = list(Path(ext_dir).glob("moe_kernels*.so")) if Path(ext_dir).exists() else []
-    if Path(ext_dir).exists() and not so_files:
-        shutil.rmtree(ext_dir)
-        print(f"[compile] cleared incomplete cache: {ext_dir}")
+    # Invalidate cache when source changes; otherwise reuse the cached .so.
+    import hashlib
+    src_path   = "/root/kernels/moe.cu"
+    src_hash   = hashlib.md5(open(src_path, "rb").read()).hexdigest()
+    ext_dir    = os.path.join(cache_root, "py311_cu128", "moe_fused")
+    hash_stamp = os.path.join(ext_dir, ".src_hash")
+
+    if Path(ext_dir).exists():
+        cached_hash = open(hash_stamp).read().strip() if os.path.exists(hash_stamp) else ""
+        if cached_hash != src_hash:
+            shutil.rmtree(ext_dir)
+            print(f"[compile] source changed — cleared cache: {ext_dir}")
+    os.makedirs(ext_dir, exist_ok=True)
+    open(hash_stamp, "w").write(src_hash)
 
     return load(
-        name="moe_kernels",
+        name="moe_fused",
         sources=["/root/kernels/moe.cu"],
         extra_cuda_cflags=CUDA_FLAGS,
         verbose=True,
