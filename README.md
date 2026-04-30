@@ -1,17 +1,17 @@
 # 15642 MoE — Custom CUDA Kernels for DeepSeek-V3/R1 MoE
 
-Custom CUDA kernels for the Mixture-of-Experts (MoE) forward pass used in DeepSeek-V3/R1, benchmarked against a pure-PyTorch reference implementation. All experiments run on Modal B200 GPUs.
+Custom CUDA kernels for the Mixture-of-Experts (MoE) forward pass used in DeepSeek-V3/R1, benchmarked against a pure-PyTorch reference implementation. Experiments currently target Modal H200 GPUs.
 
 ## Overview
 
-The reference implementation (`reference/moe_ref.py`) is a faithful PyTorch translation of the DeepSeek-V3/R1 MoE forward pass. The custom CUDA path (`kernels/moe.cu`) now exposes one `moe_forward()` entry point with no cuBLAS calls: routing compacts local expert work, Stage 1 fuses GEMM1 with SwiGLU into a compact bf16 intermediate, then Stage 2 runs GEMM2 over true FP8 W2 weights and weighted scatter.
+The reference implementation (`reference/moe_ref.py`) is a faithful PyTorch translation of the DeepSeek-V3/R1 MoE forward pass. The custom CUDA path (`kernels/moe.cu`) uses no cuBLAS calls: Python packs FP8 weights once into MMA B-fragment layout, routing compacts local expert work, Stage 1 fuses GEMM1 with SwiGLU into a block-scaled FP8 intermediate, then Stage 2 runs GEMM2 over true FP8 activations/packed W2 weights and weighted scatter.
 
 | Kernel | Replaces | Key optimization |
 |---|---|---|
+| `pack_w13_kernel`, `pack_w2_kernel` | per-MMA scalar byte gathers from weight tensors | Prepack FP8 weights into `uint32` fragments consumed directly by `mma.sync` |
 | `route_dispatch_kernel` | routing + Python-side token filtering | Selects top-k experts and compacts local `(token, expert, weight)` work on GPU |
-| `build_active_tiles_kernel` | fixed full expert/token-tile launch grid | Builds a compact list of non-empty expert token tiles to avoid idle Tensor Core CTAs |
-| `stage1_fp8_mma_kernel` | GEMM1 cuBLAS call + SwiGLU | Uses true FP8 hidden/weight inputs, computes gate/up together, and stores only bf16 `C = gate * SiLU(up)` |
-| `stage2_fp8_mma_scatter_kernel` | GEMM2 cuBLAS + per-expert `index_add_` | Uses true FP8 W2 bytes, applies W2 block scales inside accumulation, then weighted scatter |
+| `stage1_fp8_mma_kernel` | GEMM1 cuBLAS call + SwiGLU | Uses true FP8 hidden and packed W13 fragments, computes gate/up together, and stores block-scaled FP8 `C = gate * SiLU(up)` |
+| `stage2_fp8_mma_scatter_kernel` | GEMM2 cuBLAS + per-expert `index_add_` | Uses true FP8 C and packed W2 fragments, applies activation and W2 block scales inside accumulation, then weighted scatter |
 
 ### Fixed geometry (DeepSeek-V3/R1)
 
@@ -37,13 +37,13 @@ The reference implementation (`reference/moe_ref.py`) is a faithful PyTorch tran
 ├── bench/
 │   └── bench_moe.py            # End-to-end latency: custom vs PyTorch
 ├── moe_layer.py                # Kernel loader (JIT) and input builder
-├── modal_app.py                # Modal B200 entry points
+├── modal_app.py                # Modal H200 entry points
 └── requirements.txt
 ```
 
-## Running on Modal (B200)
+## Running on Modal (H200)
 
-All compute runs remotely on Modal B200 GPUs. Install Modal once locally:
+All compute runs remotely on Modal H200 GPUs. Install Modal once locally:
 
 ```bash
 pip install modal
@@ -59,7 +59,7 @@ modal run modal_app.py::test
 # Performance: end-to-end latency vs PyTorch reference
 modal run modal_app.py::bench
 
-# Interactive shell on a B200 for exploration / debugging
+# Interactive shell on an H200 for exploration / debugging
 modal run modal_app.py::shell
 ```
 
@@ -70,26 +70,27 @@ modal run modal_app.py::shell
 Implements the DeepSeek no-aux-loss routing in a single kernel. Each thread block handles one token; 256 threads (one per expert) run in parallel.
 
 **Steps:**
-1. All 256 threads compute `sigmoid(logit) + bias` in parallel
-2. Threads 0–7 compute the top-2 sum score for each of the 8 expert groups
-3. Thread 0 selects the top-4 groups (O(64) serial, negligible)
-4. All 256 threads apply the group mask
-5. Thread 0 selects the global top-8 experts from kept groups
+1. All 256 threads compute `sigmoid(logit) + bias` in parallel using `__expf`
+2. Each of the 8 warps owns one 32-expert group and computes its top-2 sum with warp shuffles
+3. Thread 0 selects the top-4 groups from the 8 group scores
+4. Each warp repeatedly selects its best remaining candidate from selected groups with warp shuffles
+5. Thread 0 chooses the global top-8 from the 8 per-group candidates
 6. Thread 0 normalises weights using `s` (without bias) scaled by `routed_scaling_factor`
+7. Local dispatch appends the active `(expert, token-tile)` entry when a new 32-row tile starts
 
 Replaces the reference sequence: `sigmoid → +bias → view → topk (group) → scatter → masked_fill → topk (global) → scatter → sum → div`.
 
-### `build_active_tiles_kernel`
+### Weight pack kernels
 
-Converts per-expert dispatch counts into a compact list of active `(expert, token-tile)` work. This prevents the large-`T` path from launching Tensor Core CTAs for empty expert slots.
+`pack_w13_kernel` and `pack_w2_kernel` convert row-major FP8 weight tensors into the exact `uint32` B-fragment layout consumed by `mma.sync.aligned.m16n8k32...e4m3.e4m3...`. `run_custom()` caches the packed tensors by weight storage so repeated benchmark iterations do not repack.
 
 ### `stage1_fp8_mma_kernel`
 
-Computes the gate and up projections from true FP8 `hidden` and `W13` inputs using `mma.sync.aligned.m16n8k32...e4m3.e4m3...`. It applies the 128-wide block scales, fuses `C = gate * SiLU(up)`, and stores only bf16 `C[expert, slot, 2048]` instead of the full FP32 `[gate, up]` buffer.
+Computes the gate and up projections from true FP8 `hidden` and packed W13 fragments using `mma.sync.aligned.m16n8k32...e4m3.e4m3...`. It applies the 128-wide block scales, fuses `C = gate * SiLU(up)`, computes a dynamic scale per `(expert, slot, 128-wide I block)`, and stores FP8 `C[expert, slot, 2048]` plus `C_scale`.
 
 ### `stage2_fp8_mma_scatter_kernel`
 
-Reads bf16 `C`, packs activation fragments to E4M3, multiplies by true FP8 `W2[expert].T` fragments, applies `gemm2_weights_scale[expert, h_block, i_block]` inside accumulation, and atomically accumulates the routed weighted result into the final `[T, H]` output.
+Reads FP8 `C`, multiplies by packed W2 fragments, applies `C_scale[expert, slot, i_block] * gemm2_weights_scale[expert, h_block, i_block]` inside accumulation, and atomically accumulates the routed weighted result into the final `[T, H]` output.
 
 ## Correctness
 

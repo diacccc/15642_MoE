@@ -15,7 +15,7 @@ from moe_layer import build_moe_inputs, run_custom
 import reference
 
 DEVICE = "cuda"
-TEST_T_VALUES = [1, 4, 8, 16, 32, 64, 128, 256]
+TEST_T_VALUES = [1, 4, 32, 64, 256, 2048, 4096, 8192, 16384]
 
 
 def _check(T, ref, got, atol=1e-2, rtol=2e-2):

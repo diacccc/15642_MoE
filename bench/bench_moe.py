@@ -17,8 +17,8 @@ import reference
 DEVICE  = "cuda"
 WARMUP  = 10
 REPEATS = 100
-BENCH_T_VALUES = [1, 4, 8, 16, 32, 64, 2048, 4096, 8192, 16384]
-
+# BENCH_T_VALUES = [1, 4, 32, 64, 256, 2048, 4096, 8192, 16384]
+BENCH_T_VALUES = [2048, 4096, 8192, 16384]
 
 def _time(fn):
     for _ in range(WARMUP):

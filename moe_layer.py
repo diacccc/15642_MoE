@@ -4,15 +4,16 @@ Kernel loader, test-input builder, and full MoE forward pass.
 kernels/moe.cu exposes a single moe_forward() that fuses:
   routing (sigmoid → group top-k → global top-k → weight norm)
   + compact local expert dispatch
-  + custom FP8 Tensor Core GEMM1 with fused SwiGLU into bf16 C
+  + custom FP8 Tensor Core GEMM1 with fused SwiGLU into block-scaled FP8 C
   + custom FP8 Tensor Core GEMM2 with scatter accumulation
 
-run_custom() passes hidden_states/gemm1_weights as true FP8 tensors for Stage 1,
-passes gemm2_weights as true FP8 tensors for Stage 2, and delegates to
+run_custom() passes hidden_states as true FP8 tensors, packs gemm1/gemm2
+weights once into the exact mma.m16n8k32 B-fragment layout, and delegates to
 ops.moe_forward() without materializing dequantized weights.
 """
 
 import os
+import weakref
 import torch
 from torch.utils.cpp_extension import load
 
@@ -25,6 +26,7 @@ BLOCK    = 128
 
 # ── Lazy kernel loader ────────────────────────────────────────────────────────
 _custom_ops = None
+_packed_weight_cache = {}
 
 def _load_custom_ops():
     global _custom_ops
@@ -72,6 +74,27 @@ def build_moe_inputs(T: int = 128, device: str = "cuda", seed: int = 0):
     )
 
 
+def _cached_pack(cache_name, tensor, pack_fn):
+    tensor = tensor.contiguous()
+    key = (
+        cache_name,
+        int(tensor.data_ptr()),
+        tuple(tensor.shape),
+        str(tensor.dtype),
+        str(tensor.device),
+        int(tensor._version),
+    )
+    entry = _packed_weight_cache.get(key)
+    if entry is not None:
+        owner_ref, packed = entry
+        if owner_ref() is tensor:
+            return packed
+
+    packed = pack_fn(tensor)
+    _packed_weight_cache[key] = (weakref.ref(tensor), packed)
+    return packed
+
+
 # ── Full MoE forward with custom kernel ──────────────────────────────────────
 @torch.no_grad()
 def run_custom(ops,
@@ -80,12 +103,15 @@ def run_custom(ops,
                gemm1_weights, gemm1_weights_scale,
                gemm2_weights, gemm2_weights_scale,
                local_expert_offset, routed_scaling_factor):
+    gemm1_weights_packed = _cached_pack("w13", gemm1_weights, ops.pack_w13)
+    gemm2_weights_packed = _cached_pack("w2", gemm2_weights, ops.pack_w2)
+
     return ops.moe_forward(
         hidden_states.contiguous(),
         hidden_states_scale.to(torch.float32).contiguous(),
-        gemm1_weights.contiguous(),
+        gemm1_weights_packed,
         gemm1_weights_scale.to(torch.float32).contiguous(),
-        gemm2_weights.contiguous(),
+        gemm2_weights_packed,
         gemm2_weights_scale.to(torch.float32).contiguous(),
         routing_logits.to(torch.float32).contiguous(),
         routing_bias.to(torch.float32).reshape(-1).contiguous(),

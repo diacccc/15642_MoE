@@ -9,7 +9,7 @@ Usage (with Modal installed and `modal setup` done):
     # Run per-kernel benchmarks
     modal run modal_app.py::bench
 
-    # Drop into an interactive shell on a B200
+    # Drop into an interactive shell on an H200
     modal shell modal_app.py::shell
 
 The CUDA extension is JIT-compiled at container start via torch.utils.cpp_extension.
@@ -23,7 +23,7 @@ import modal
 HERE = Path(__file__).parent
 
 # ── Image ─────────────────────────────────────────────────────────────────────
-# B200 (Blackwell SM100) requires CUDA 12.8+ and PyTorch 2.7+
+# H200 (Hopper SM90) target; CUDA 12.8/PyTorch 2.7 also supports B200 if needed.
 image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.8.1-devel-ubuntu22.04",
@@ -131,6 +131,6 @@ def bench():
 
 @app.function(gpu=GPU, timeout=3600, volumes=VOLUMES)
 def shell():
-    """Interactive Bash shell on a B200 for exploration and debugging."""
+    """Interactive Bash shell on an H200 for exploration and debugging."""
     import subprocess
     subprocess.run(["/bin/bash", "-l"])
